@@ -1,16 +1,20 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
+# In[ ]:
 
 
-# Driver_NN_PID   -  Version 0.6
+# Driver_NN_PID_6_1   -  Version 6.1
 '''Latest version:  Combines NN_for_PID and PID_test module codes.
-In this version, NeuralNet serves as a "judge" using only its
-accuracy to discard batches if there is no improvement.  That is,
-we are not using the 3 output node results to directly input to the PID.
+In this version as CNN, NeuralNet serves as a "judge" using only its
+accuracy to discard batches if there is no im-provement.
+
+For this version, use data file fileName = training.csv.
+This will be split equally  into trainimg and test data for the time being.
+Probably will want 20 - 80% as more commonly employed.
+Controller output file is: control.csv.
    
-We use batch'es' which have 20 rows with 11 entries as a simulation,
+Batch'es' are files which have 20 rows with 11 entries as a simulation,
 the first 8 of each row are MAP (mean arterial pressure) values;
 the next 3 of which are the PID parameters Ki, Kd, and Kp; and
 the last is the PID's performance score in approaching a target MAP.
@@ -36,7 +40,7 @@ Outer_loop:
    of PID in reaching a target MAP.  In the combined modules, 
    Driver_PID_NN, the neural net 
    runs batches of PID results seeking to improve the PID's
-   internal parameters.
+   internal parameters by outputting its accuracy.
 
 Conventions:
 i - indexes the outer loop which runs through a batch of profiles
@@ -68,22 +72,30 @@ dbg = True  # top level results
 dbg0 = False  # body response model
 dbg1 = False  # more detail
 dbg2 = False  # set_traces on PID
-dbg3 = False  # set traces on NN
-dbg4 = False  # Keras errors
+dbg3 = False  # more set traces on PID
+dbg4 = False  # details from CNN
 dbg5 = False # end of n-loop
 dbg6 = False # trap index error near PID
 dbg7 = False # create batch methods
 dbg8 = False # stop at NN stages
+dbg11 = False # check pump model
+dbg18 = True # im-provement and accuracy
+dbg20 = False # advance controller
+dbg21 = False # stop at end of NN
+dbg23 = False # first_deriv
+dbg24 = False # entering m-loop and following
+modelCount = 0  # limits model summary output to 1
 
 # flow control
-open_loop = True # training with NN updating PID parameters
-use_exponential_damping_in_pump = False
+includeCNN = True # training with NN updating PID parameters
+useExponentialDampingInPump = True
 training = True    # training versus closed loop runs
 preview = True
 summary = True
 
 import sys
 import csv
+import ast
 import math
 import random
 import inspect
@@ -91,9 +103,9 @@ import inspect
 import numpy as np
 from numpy import array
 
-from sklearn.datasets import load_iris
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OneHotEncoder
+#from sklearn.datasets import load_iris
+#from sklearn.model_selection import train_test_split
+#from sklearn.preprocessing import OneHotEncoder
 
 from keras.models import Sequential
 from keras.layers import Dense
@@ -105,8 +117,8 @@ from IPython.core.debugger import Tracer; debug_here = Tracer()
 # Pump simulator parameters
 delay = 1   # assumed to be about one time step for now (10 sec.).
 resistance_factor = 0.9  # degree to which the pump can actually infuse.
-pump_noise_level = 3.0
-use_exponential_damping_in_pump = True
+pumpNoiseLevel = 1.0
+useExponentialDampingInPump = True
 eMax = 20
 # this factor also includes the linear transfer function constant.
 
@@ -126,7 +138,6 @@ Vm2 = 0
 M = 20    # PID's batch size
 scores = [0 for i in range(M)]  # given by PID for how close to target MAP it reaches
 delta_K = []
-deriv_limit = 0.5  # limits the derivative estimate in derivative
 ave_score = 0
 num_scores = 0
 
@@ -143,52 +154,66 @@ i = 0          # loop batch numbering starts with 0
 
 # Hyperparameters
 numCycles = 5     # n-loop range.  file of 100 lines can be split into 5 batchs of 20
+numRows = 20      # i-loop will run batch_n.through with this many rows thru PID
 numParms = 3      # number of PID parameters to be optimized
 batchSize = 20    # NN's batches (may be different from baseBatches for PID
 noise = 5         # noise level with uniform distribution, i.e. white noise
 quartile = 0.2    # null hypothesis for random white noise.  Lower is better.
-percentile = 0.05 # for null hypothesis for Gaussian noise in NN accuracies
-P = percentile    # short name for percentile
+percentile = 0.0001 # for null hypothesis for Gaussian noise in NN accuracies
+
 # N = 3           # dimension of PID's parameters, currently hard-coded 3
 targetMAP = 65    # desireable mean arterial blood pressure in pigs
 initialMAP = 60   # This is for a typical hypovolemic (hemorrhaged) MAP.
 initialError = 5
 initialLoss = 0   # this gets the fluid loss model recursion started.
-initialInfusion = 11
+initialInfusion = 30
 initialBleed = 7
 
 L = 3     # pure time delay, or lag in the impulse response, i.e. 10 sec.
 Kp = 1.2  # proportional gain (g kg-1 min-1) mmHg-1,  Might be as low as 0.3.
 Ki = 0.8  # integral gain
 Kd = 0.1  # differential gain
+Nparms = 3
+Kparms = [Kp, Ki, Kd]
 Ci = 2.1  # 1 mmHg rise in MAP proportional to 1 mL infusion
 Cm = 1    # Set Cm = 0 to eliminate bleeding component entirely from PID control.
 #    Set Cm = 0 and Cl= 1 both to eliminate the fluid loss file input and
 #    there could be a built-in updating of the loss "v" for steady bleed.
 M = 1     # multiplier of basic time steps, 10 steps over 1 second
 TI = M * 10   # total simulation time
-T = 5    # time constant in the step response of "proportional"
+Tc1 = 5   # time constant in the step response of "proportional".
+#hd = []
+hd = [0]
 
 # Set Cm = 0 to eliminate bleeding, i.e. fluid response VB0 from error:
 #      e1 = (targetMAP - Ci * infusion  +  Cm * VB0)
 
 # Following parametrize the body response function due to Hahn et al. slide 6
 VB = 2500     # estimate of blood volume for a 43 kg swine
-K = 1         # feedback gain
+K0 = 1        # feedback gain
 alpha = 2.5   # fluid transfer rate in body compartments for 900 mL bleed (Hahn)
 
 del_t = 1     # discrete time difference or sampling interval (10  sec)
 targetMAP = 80 # mmHg typical for swine
 initialMAP = 60 # This is for a typical hypovolemic (hemorrhaged) MAP.
+#                 The PID starts with this estimate and aims for targetMAP.
+L = 3     # pure time delay, or lag in the impulse response. They used 10 sec.
+Kp = 1.2  # proportional gain (g kg-1 min-1) mmHg-1,  Might be as low of 0.3.
+Ki = 0.8  # integral gain
+Kd = 0.1  # differential gain
+Ci = 2.1  # 1 mmHg rise in MAP proportional to 1 mL infusion
+Cm = 0    # Set Cm = 0 to eliminate bleeding component entirely from PID control.
+#    If Cl = 0, there is a built-in updating of the loss "v".s  ?????
+Ms = 1    # multiplier of basic time steps, 10 over 1 second
+TI = Ms * 10   # total simulation time
+Tc1 = 5   # time constant in the step response of "proportional".
 
 # Here is the final combination in PID.  Set Cm = 0 to eliminate bleeding.
 #      self.e.append(targetMAP - Ci * infusion + Cm * self.VB0)
-        
-# Following parametrize the body response function due to Hahn et al. slide 6
-VB = 2500     # estimate of blood volume for a 43 kg swine
-K = 1         # feedback gain
-alpha = 2.5   # fluid transfer rate in body compartments for 900 mL bleed (Hahn)
+
+# miscellaneous  SORRY ABOUT ALL THE GLOBALS
 step = 1
+modelCount = 0
 
 #------- Helper functions -------------
 
@@ -204,11 +229,11 @@ def print_frame():
         print(" ")
     return info.lineno
 
-#-----------------------------------------
+#--------------------------------------
 #-- Search and gradient descent process --
 # acc and acc_prev are using profile scores in this version
 def step_j_th_parm(acc, acc_prev, j1, k, P, K, epsilon):
-    # Limits change to P % of acc_m1, e.g. 1 %.
+    # Limits change to P % of acc, e.g. 1 %.
     change = 0
     if(dbg7):
         set_trace()
@@ -235,14 +260,16 @@ def step_j_th_parm(acc, acc_prev, j1, k, P, K, epsilon):
     delta_K[j1][k] = change + K[j1]
 
     # Note, scores and accuracy may continue to improve even if we keep the
-    # same batch data randomized somewhat.
-    # After 3 inner loops, all coordinaes of K are updated.
+    #s ame batch data randomized somewhat.
+    # Note also that K does accumulate over j, so after 3 inner loops, all
+    # coordinaes of K are updated.
     return delta_K
 #--------------------------------------
 
 def create_new_batch (i, bBatch, nBatch, delta_K, noise):
-    # This creates a new batch base on the the best gradient steps
-    # as the PID  parameters are extracted and recorded in the
+    # These are the Inner-loop's batches where PID parameters are
+    # varied one at a time.  The best gradient steps in each of
+    # the N PID  parameters are extracted and recorded in the
     # next base_batch for the NN.
     success = 1
     rows = []
@@ -256,7 +283,6 @@ def create_new_batch (i, bBatch, nBatch, delta_K, noise):
                 rows.append(row)
                 count += 1     
             fileSize = count
-        inp.close()
         if(fileSize != M):
             print("*** create_new_batch: fileSize = ",fileSize," at i = ",i)
             print("    bBatch = ",bBatch)
@@ -275,15 +301,16 @@ def create_new_batch (i, bBatch, nBatch, delta_K, noise):
         print(print_frame())
         success = 0
     except:
-        print("Unexpected error:", sys.exc_info()[0])
+        print("Unexpected error:", sys.exc_info()[0],sys.exc_info()[1])
         print(print_frame())
         success = 0
         raise
     finally:
+        inp.close()
         if (success == 0):
             return 0       
     try:
-        with open(nBatch, 'w+', newline ='', encoding = "utf8") as outp:
+        with open(nBatch, 'w', newline ='', encoding = "utf8") as outp:
             #-write intermediate batch i_j with variation in the j-coordinate
             csv_out = csv.writer(outp, delimiter=',')
             k = 0
@@ -294,11 +321,11 @@ def create_new_batch (i, bBatch, nBatch, delta_K, noise):
                 for m in range(0,8):
                     val = row[m]
                     meas.append(val)
-                
-                # these steps are decreased as good MAP value approached
-                Kp = K[0] + delta_K[k][0]
+
+                # Note: this does not alter the K params
+                Kp = delta_K[k][0]   # this step is decreased as good value approached
                 meas.append(Kp)
-                Ki = K[1] + delta_K[k][1]
+                Ki = delta_K[k][1]
                 meas.append(Ki)
                 Kd = K[2] + delta_K[k][0]
                 meas.append(Kd)
@@ -306,7 +333,6 @@ def create_new_batch (i, bBatch, nBatch, delta_K, noise):
                 # Note:  we now append scores in these newBatches
                 # for the NN 
                 csv_out.writerow(meas)
-        outp.close()
     except OSError as err:
         print("OS error: {0}".format(err))
         print(print_frame())
@@ -320,7 +346,7 @@ def create_new_batch (i, bBatch, nBatch, delta_K, noise):
         print(print_frame())
         success = 0
     except:
-        print("Unexpected error:", sys.exc_info()[0])
+        print("Unexpected error:", sys.exc_info()[0],sys.exc_info()[1])
         print(print_frame())
         success = 0
         raise
@@ -352,7 +378,6 @@ def create_batch_i_j (i, j1, bBatch, dBatch, K, noise):
             csv_in = csv.reader(inp, delimiter=',')
             for row in csv_in:
                 rows.append(row)
-        inp.close()
         if(dbg7):
             set_trace() ##################################
         if(fileSize != M):
@@ -372,15 +397,16 @@ def create_batch_i_j (i, j1, bBatch, dBatch, K, noise):
         print(print_frame())
         success = 0
     except:
-        print("Unexpected error:", sys.exc_info()[0])
+        print("Unexpected error:", sys.exc_info()[0],sys.exc_info()[1])
         print(print_frame())
         success = 0
         raise
     finally:
+        inp.close()
         if (success == 0):
             return 0
     try:
-        with open(dBatch, 'w+', newline ='', encoding = "utf8") as outp:
+        with open(dBatch, 'w', newline ='', encoding = "utf8") as outp:
             #-write intermediate batch i_j with variation in the j-coordinate
             csv_out = csv.writer(outp, delimiter=',')
             k = 0
@@ -411,11 +437,10 @@ def create_batch_i_j (i, j1, bBatch, dBatch, K, noise):
                     # Note:  we don't append scores in these deltaBatches
                     # scores are only appended in new batches created for the NN
                 else:
-                    if(dbg):
-                        print("*** Wrong j1 = ",j1,", at i = ",i)
+                    print("*** Wrong j1 = ",j1,", at i = ",i)
+                    print(print_frame())
                     success = 0
                 csv_out.writerow(meas)
-        outp.close()
     except OSError as err:
         print("OS error: {0}".format(err))
         print(print_frame())
@@ -429,7 +454,7 @@ def create_batch_i_j (i, j1, bBatch, dBatch, K, noise):
         print(print_frame())
         success = 0
     except:
-        print("Unexpected error:", sys.exc_info()[0])
+        print("Unexpected error:", sys.exc_info()[0],sys.exc_info()[1])
         print(print_frame())
         success = 0
         raise
@@ -462,7 +487,6 @@ def create_batch_i (i, bBatch, nBatch, K, scores, noise):
             for row in csv_in:
                 rows.append(row)
                 count += 1
-        inp.close()
         fileSize = count
         if(dbg7):
             set_trace() ##########################
@@ -484,7 +508,7 @@ def create_batch_i (i, bBatch, nBatch, K, scores, noise):
         print(print_frame())
         success = 0
     except:
-        print("Unexpected error: ", sys.exc_info()[0])
+        print("Unexpected error: ", sys.exc_info()[0],sys.exc_info()[1])
         print(print_frame())
         success = 0
         raise
@@ -493,7 +517,7 @@ def create_batch_i (i, bBatch, nBatch, K, scores, noise):
         if (success == 0):
             return success
     try:
-        with open(nBatch, 'w+', newline ='', encoding = "utf8") as outp:
+        with open(nBatch, 'w', newline ='', encoding = "utf8") as outp:
             csv_out = csv.writer(outp, delimiter=',')
             if(dbg7):
                 set_trace() #####################
@@ -519,7 +543,6 @@ def create_batch_i (i, bBatch, nBatch, K, scores, noise):
                 datum = float(scores[k])
                 meas.append(datum)
                 csv_out.writerow(meas)
-        outp.close()
     except OSError as err:
         print("OS error at 317: {0}".format(err))
         print(print_frame())
@@ -533,7 +556,7 @@ def create_batch_i (i, bBatch, nBatch, K, scores, noise):
         print(print_frame())
         success = 0
     except:
-        print("Unexpected error at 326:", sys.exc_info()[0])
+        print("Unexpected error:", sys.exc_info()[0],sys.exc_info()[1])
         print(print_frame())
         success = 0
         raise
@@ -563,77 +586,75 @@ def NeuralNet (filename):
     from keras.layers import Dense
     from keras.optimizers import Adam
 
+    global modelCount
     data = []
     try:
         with open(filename, 'r', newline = '', encoding = "utf8") as inp:
             csv_in = csv.reader(inp, delimiter=',')
             for row in csv_in:
                 data.append(row)
-        inp.close
     except csv.Error as e:
         sys.exit('file {}, line {}: {}'.format(filename, reader.line_num, e))
         print("***Input file couldn't not be openned")
-
     finally:
         inp.close
         print("test completed normally.")
 
     dataset = array(data)
     xy = dataset.shape
-    print("data.shape = ",xy)
+    if(dbg4): print("data.shape = ",xy)
 
     # separate data
     split = 10
     train, test = dataset[:split,:], dataset[split:,:]
-    print("MAIN CODE: train----------------")
-    print(train)
-    print("MAIN CODE: test----------------")
-    print(test)
-    print("==========================================")
-    print(" ")
-    print(" As it is split:")
+    if(dbg4):
+        print("MAIN CODE: train----------------")
+        print(train)
+        print("MAIN CODE: test----------------")
+        print(test)
+        print("==========================================")
+        print(" ")
+        print(" As it is split:")
     train_x = train[:,0:8]
-    ##train_x = train[:,0:6]
-    train_y= train[:,-4:-1]
-
-    print(" ")
-    print("train_x ----------------")
-    print(train_x)
-    print("train_y ----------------")
-    print(train_y)
-
-    print(" ")
-    print(" test_x,----------------")
+    train_y = train[:,-4:-1]
+    if(dbg4):
+        print(" ")
+        print("train_x ----------------")
+        print(train_x)
+        print("train_y ----------------")
+        print(train_y)
+        print(" ")
+        print(" test_x,----------------")
     test_x = test[:,0:8]
-    #####test_x = test[:,0:6]
-    print(test_x)
-    print(" test_y,----------------")
+    if(dbg4):
+        print(test_x)
+        print(" test_y,----------------")
     test_y = test[:,-4:-1]
-    print(test_y)
-    print(" ")
+    if(dbg4):
+        print(test_y)
+        print(" ")
     # THIS IS TRICKY - CREATED ERROR IN SIMILAR CODE ??
     #train_x, test_x, train_y, test_y = train_test_split(x, y, test_size=0.20)
 
-    if(dbg8):
-        set_trace()
+    if(dbg8): set_trace() ##################
     # Build the model
     model = Sequential()
 
-    if(dbg8):
-        set_trace()
-    #####model.add(Dense(10, input_shape=(6,), activation='relu', name='fc1'))
+    if(dbg8): set_trace() #################
+    #---------- TONY, RIGHT HERE I'D LIKE TO EXTEND INPUTS TO MORE THAN 10
+    
     model.add(Dense(10, input_shape=(8,), activation='relu', name='fc1'))
     model.add(Dense(10, activation='relu', name='fc2'))
     model.add(Dense(3, activation='softmax', name='output'))
 
     # Adam optimizer with learning rate of 0.001
     optimizer = Adam(lr=0.001)
-    if(dbg8):
-        set_trace()
+    if(dbg8): set_trace() ################
     model.compile(optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
 
-    print('Neural Network Model Summary: ')
-    print(model.summary())
+    modelCount += 1
+    if (modelCount < 2):
+        print(model.summary())
     '''Layer (type)                 Output Shape              Param #   
     =================================================================
     fc1 (Dense)                  (None, 10)                50        
@@ -646,22 +667,24 @@ def NeuralNet (filename):
     Trainable params: 193
     Non-trainable params: 0'''
 
-    # Train the model
-    if(dbg8):
-        set_trace()
-    model.fit(train_x, train_y, verbose=2, batch_size=5, epochs=200)
+    # Train the model 
+    if(dbg8): set_trace() ###############
+    model.fit(train_x, train_y, verbose=2, batch_size=5, epochs=20)
 
     # Test on unseen data
-    if(dbg8):
-        set_trace()
+    if(dbg8): set_trace() ###############
     results = model.evaluate(test_x, test_y)
 
     print('Final test set loss: {:4f}'.format(results[0]))
     print('Final test set accuracy: {:4f}'.format(results[1]))
+    if(dbg21): set_trace() ##############
+    if(dbg4): print("CNN results = ",results)
+    #---check results
     return results
+
 #===================================
-# This class is from from PID_test -- tests PID_incremental_controller
-# if further module testing is needed for the PID.
+# This class is from from PID_test -- tests a PID controller
+# along with a CNN.
 # These results were obtained for rabbits with norepinephrine infusion.
 # May have to tinker with the constants a bit for other animals and infusants.
 '''
@@ -672,7 +695,7 @@ e is the error between targetMAP and observed MAP (mmHg).'''
 # Model_increment is a time-stepped linear body response model to infusion and fluid loss.
 # It follows: Bighamian et al. A Lumped-Parameter Blood Volume Model.
 
-# T is sampling interval
+# TI is sampling interval
 # VB is the response to u and v as change in blood volume output normalized by VB0
 # To convert this to control "delta V", we have delta V = VB * (VB0 - VB1),
 # where VB is blood volume estimate,
@@ -688,56 +711,91 @@ e is the error between targetMAP and observed MAP (mmHg).'''
 # i is time step counter, each step being T
 
 #--- Helper functions
+
 # Infusion pump transfer function
 # We can give pump some history in the error array
-def pump_model(error, infusion, delay, pump_noise_level):
-    if(use_exponential_damping_in_pump):
+def pump_model(error, infusion, delay, pumpNoiseLevel):
+    if(dbg11): set_trace() ##
+    # Step thru pump model
+    if(useExponentialDampingInPump):
         if (len(error) >= delay):
             exponent = -(error[-delay] / eMax)
-            if (exponent < 100 and exponent > -100):
+            if (exponent < 30 and exponent > -30):
                 slowdown = 1 - math.exp(exponent)  # prevents going too fast as error nears 0
-                if(dbg): print("slowdown = ",slowdown)
+                if(dbg11): print("slowdown = ",slowdown)
             else:
                 slowdown = 1
                 print("*** pump exponent too large or too small")
             result = infusion * slowdown * resistance_factor
-            return result + pump_noise_level * random.uniform(0, 1)
+            return result + pumpNoiseLevel * random.uniform(0, 1)
         else:
-            return infusion  + pump_noise_level * random.uniform(0, 1)
+            return infusion  + pumpNoiseLevel * random.uniform(0, 1)
     else:
-        result = infusion * resistance_factor  + pump_noise_level * random.uniform(0, 1)
+        result = infusion * resistance_factor  + pumpNoiseLevel * random.uniform(0, 1)
         return result
     
 # Impulse response, included in the "proportional" component
 def impulse(i):
     val = 0
-    if (i < T and i >= L):
-        val = (Ki / T) * math.exp(-((i - L) / T))       # Kashihara equ (1)
-    if(dbg1):
+    if (i < Tc1 and i >= L):
+        val = (Ki / Tc1) * math.exp(-((i - L) / Tc1))       # Kashihara equ (1)
+    if(dbg2):
         print("impulse: val = ",val)
     return val
 
 # e1 is the "error" between target MAP and measured MAP.
-# calling sequence:  self.i - T, self.i - 1, self.i, e1
+# calling sequence:  self.i - Tc1, self.i - 1, self.i, e1
 def integral(t0, tN, i, e):
     sum = 0
     len_e = len(e)
-    if(dbg2):print("integral: len_e = ",len_e)
+    if(dbg2): print("integral: len_e = ",len_e)
     for j in range(t0, tN - 1):
         if ( ((i - j) > -1) and (j <= len_e)):
             sum = sum + impulse(i - j) * e[j] * del_t
         return sum
 
-def derivative(h1, i):
-    len_h = len(h1)
-    if(dbg2):print("derivative: len_h = ",len_h,", i = ",i," h1 = ",h1)
-    if ((i < T - 1) and (i > 0) and (i <= len_h) and (len_h > 2)):
-        deriv = (h1[i] - h1[i-2]) / 2 * del_t
-    elif ((i < T - 1) and (i > 0) and (i <= len_h) and (len_h > 1)):
-        deriv = (h1[i] - h1[i-1]) / del_t
+def first_deriv(h1, i):   # WE'VE GOT TO FILTER THIS A LOT
+    #if(dbg23): set_trace()
+    # step thru
+    global hd
+    derType = 0
+    diff = 0
+    deriv = 0
+    lenh1 = len(h1)
+    if(dbg3):
+        print("i = ",i,", h1 : ",h1)
+    if(i >= 4 and lenh1 > 3):
+        hd.append((h1[-4] + h1[-3] + h1[-2] + h1[-1]) / 4)
+    elif(i >= 3 and lenh1 > 2):
+        hd.append((h1[-3] + h1[-2] + h1[-1]) / 3)
+    elif(i >= 2 and lenh1 > 1):
+        hd.append((h1[-2] + h1[-1]) / 2)
+    elif(i >= 1 and lenh1 > 0):
+        hd.append(h1[-1])  # THIS MAY BE JERKY
     else:
+        hd.append(0)
+    #if(dbg23): set_trace() #############
+    # step thru
+    len_h = len(hd)
+    if ((i < Tc1 - 1) and (i > 2) and (i <= len_h) and (len_h > 2)):
+        derType = 2
+        diff = hd[i-1] - hd[i-3]
+        deriv = diff / 2 * del_t
+    elif ((i < Tc1 - 1) and (i > 1) and (i <= len_h) and (len_h > 1)):
+        derType = 1
+        diff = hd[i-1] - hd[i-2]
+        deriv = diff / del_t
+    else:
+        dertype = 0
         deriv = 0
-        
+    if(dbg1 or dbg23):
+        if(dbg23): set_trace() #############
+        ## step thru
+        print("---first deriv: len h = ",len_h,", i = ",i,", derivative Type = ",derType)
+        print(" - diff = ",diff,", hd = ",hd)
+        print(" - Tc1 - 1 = ",Tc1-1,", returning deriv = ",deriv)
+    
+    if(dbg23): set_trace() #############
     return deriv
 
 # Fill the losses list, v1, with the second column.
@@ -751,7 +809,6 @@ def get_losses(losses_f):
             count += 1
             for row in csv_in:
                 v1.append(row[1])
-        inp.close()
         if(dbg):
             print("-getLosses returned ",count," lines from ",losses_f)
     except csv.Error as e1:
@@ -762,29 +819,36 @@ def get_losses(losses_f):
         print ("***getLosses file error with :",losses_f)
         print(print_frame())
     except:
-        print("***getLosses: Unexpected error at 572:", sys.exc_info()[0])
+        print("***getLosses: Unexpected error:", sys.exc_info()[0],sys.exc_info()[1])
         print(print_frame())
         raise
     finally:
+        inp.close()
         print("-getLosses: Fluids test opened normally.  398")
         
 #==============================
 class PID:
-    def __init__(self,i,j,k,m,losses_f,MAP,control_f,VB=2500,K0=2.1,alpha=0.5):
-        self.VB = VB
-        self.K0 = K0
-        self.alpha = alpha
-        self.losses_f = losses_f
-        self.MAP  = MAP            # this is usually a row of data from a batch
-        self.control_f = control_f
-        self.finalMAP = 0
-        self.control = ""
-        self.total_outputs = 0
-        self.count = 0  #
+    #    def __init__(self,i1,j1,k1,m1,map1,losses_f,row,control_f,finalMAP):
+    def __init__(self,i,j,k,m,map1,losses_f,row,control_f,finalMAP):
         self.i = i  # time step number (now row number in this test)
         self.j = j  # controller param number = 0, 1, 2 (not used)
         self.k = k  # controller now reading row k
         self.m = m  # at row element m
+        self.map1  = map1 # should be recent value of finalMAP
+        self.losses_f = losses_f  # fluid loss file name
+        self.row = row  # usually a row of data
+        self.control_f = control_f # name of the controller output(control.csv)
+        self.finalMAP = finalMAP  # total MAP at this step
+        
+        # body parameters now set locally from global values
+        self.VB = VB
+        self.K0 = K0
+        self.alpha = alpha
+        
+        self.control = ""   # This will be a row of output from the controller
+        self.mapRow = []
+        self.total_outputs = 0
+        self.count = 0  #
 
     def run_model(self):
         A = 0 # It's easier to debug large formulas in pieces
@@ -820,8 +884,7 @@ class PID:
                 print("--- Model: preparing model at i = ",str(self.i))," ----  448"
                 print("Um2 = ",Um2,", Um1 = ",Um1)
                 print("Vm2 = ",Vm2,", Vm1 = ",Vm1)
-            if(dbg2):
-                set_trace() ################## 
+            if(dbg2): set_trace() ################## check and step
             A = 2 * VB1 - VB2
             B = - self.K0 * (VB1 - VB2)
             C = (self.K0 / self.VB) * ((float(Um1) - float(Um2)) - (float(Vm1) - float(Vm2)))
@@ -852,39 +915,44 @@ class PID:
                 print("Um2 = ",Um2,", Um1 = ",Um1)
                 print("Vm2 = ",Vm2,", Vm1 = ",Vm1)
     
-    def advance_PID(self):
+    #    def advance_Table (self, mapRow, m1):
+    def advance_PID(self, mapRow, m):
         A1 = 0 # It's easier to debug large formulas in pieces
         B1 = 0
         C1 = 0
         D1 = 0
         E1 = 0
+        map1 = mapRow[m]
         if(dbg2):
             set_trace() #########################################
-        if (dbg1): print("-advance_PID: at entry, i = ",self.i,", m = ",self.m)
+        if (dbg1): print("-advance PID: at entry, i = ",self.i,", m = ",self.m)
         try:
             out_f = open(self.control_f,"a",newline='',encoding="utf8")
             csv_out = csv.writer(out_f, delimiter=',')
             controller = " "
 
-            # start the filter as best can for first time step
-            if (self.m != None and self.m < 2):
+            # start the filter as best can for first time step m = 0
+            if (self.m != None and self.m < 1):
                 e1.append(initialError)
                 v1.append(initialLoss)
                 u1.append(initialInfusion)
                 
                 # Here is the simulated pump, supplying u1
-                result = pump_model(e1, initialInfusion, delay, pump_noise_level)
+                pump_out = pump_model(e1, initialInfusion, delay, pumpNoiseLevel)
                 
-                u1.append(result)   # initial infusion. (This accumulates total)
+                if(dbg20): set_trace() ########################   
+                firstInfusion = pump_out + initialInfusion
+                
+                u1.append(firstInfusion)   # initial infusion. (This accumulates total)
                 controller = str(self.i) + "," + str(self.m) + "," + str(u1[0]) + "," + str(v1[0]) + "," + str(e1[0])
                 out_f.write(controller)
-                self.finalMAP = 0
+                self.finalMAP = firstInfusion
             
             # subsequent time steps
             elif(self.m != None):
                 # -------- PID control function
                 if (dbg1): 
-                    print("-advance_PID: at i = ",str(self.i),", m = ",str(self.m))
+                    print("-advance PID: at i = ",str(self.i),", m = ",str(self.m))
                 # (Easier debugging to break up formula into these 4 parts)
                 if(dbg2):
                     set_trace() ##########################
@@ -894,35 +962,42 @@ class PID:
                 
                 # integral term
                 C1 = 0
-                if (self.m >= T):  # integral goes back T - 1 steps
-                    C1 = Ki * integral (self.m - T, self.m - 1, self.m, e1)
+                if (self.m >= Tc1):  # integral goes back Tc1 - 1 steps
+                    C1 = Ki * integral (self.m - Tc1, self.m - 1, self.m, e1)
                 D1 = 0
 
                 # differential term
                 if (self.m > 1):
-                    deriv = derivative (e1, self.m - 1)
-                    if (abs(deriv) <= deriv_limit):
-                        D1 = Kd + deriv
+                    deriv = first_deriv (e1, self.m - 1)
+                    if (abs(deriv) <= 0.5 ):
+                        D1 = Kd * deriv
                     else:
                         if(dbg):
-                            print("-- advance_PID: Had to truncate deriv ",deriv)
-                        if (deriv > deriv_limit):
+                            print("-- advance PID: Had to truncate deriv ",deriv)
+                        if (deriv > 0.5):
                             D1 = Kd * 0.5
                         elif (deriv < 0.5):
                             D1 = - Kd * 0.5
                             
                 infusion = B1 + C1 + D1   # increment of infusion recommended
                 
-                pump_out = pump_model(e1, infusion, delay, pump_noise_level)  # pump transfer function
+                pump_out = pump_model(e1, infusion, delay, pumpNoiseLevel)  # pump transfer function
                 # pump may decrease the infusion rate if it is too fast, depending on e1
                 
+                # tot_infusion = pump_out +  u1[self.m1 - 1]  WHY m1 - 1 ???
                 tot_infusion = pump_out +  u1[self.m - 1]
                 
                 u1.append(tot_infusion) # total infusions up to and including m-th time step
 
                 #--- Here is the combination: total infusion - fluid loss
                 self.finalMAP = Ci * tot_infusion  -  Cm * VB0
-                er = float(self.MAP[-1]) - self.finalMAP
+                er = float(mapRow[-Nparms-1]) - self.finalMAP
+    
+                # mapRow[-1] SHOULD BE EQUAL TO map1 -- CHECK
+                if(dbg24):
+                    if(mapRow[-Nparms-1] != map1):
+                        print("mapRow[-Nparms-1] = ",mapRow[-Nparms-1],", map1 = ",map1)
+                    set_trace() #############  567
                 e1.append (er)
 
                 ln_u = len(u1)
@@ -938,33 +1013,31 @@ class PID:
                     ca = "0"
                     da = "0"
                     if(dbg1):
-                        print("-advance_PID: ln_u = ",ln_u,", ln_v = ",ln_v,". Can't compute self.control")
+                        print("-advance PID: ln_u = ",ln_u,", ln_v = ",ln_v,". Can't compute self.control")
 
-                if(dbg2):
+                if(dbg1):
                     print(" ")
-                    print("-advance_PID  A1 = ",A1,", B1 = ",B1,", C1 = ",C1,", D1 = ",D1)
-                    print(" - e is now : ",e1[-m:-1])
+                    print("-advance PID  A1 = ",A1,", B1 = ",B1,", C1 = ",C1,", D1 = ",D1)
+                    print(" - e is now : ",e1[-11:-1])
                     print(" - infusion : ",infusion)
-                    print(" - u is now : ",u1[-m:-1])
-                    print(" - v is now : ",v1[-m:-1])
+                    print(" - u is now : ",u1[-11:-1])
+                    print(" - v is now : ",v1[-11:-1])
                     print(" - m = ",aa,", u1 = ",ba,", v1 = ",ca,", e1 = ",da)   
                     
                 self.control = aa + "," + ba + "," + ca + "," + da   # keeps a record of control
 
-                if (dbg): print("-advance_PID:  control = " + self.control)
+                if (dbg): print(" - advance PID:  control = " + self.control)
 
                 # Note: this is the file needed in a trained, closed-loop control.
                 # Be sure to delete this file before starting a closed-loop run.
                 out_f.write(self.control)
-                out_f.close()
                 
                 self.total_outputs += 1
 
-                #print("-advance_PID: updating i to ",self.i)
-                if(dbg1): print("-advance_PID returning error ",e1[-m:-1])
+                #print("-advance PID: updating i to ",self.i)
+                if(dbg1): print(" - advance PID returning error ",e1[-11:-1])
             else:
                 print("*** self.i  is a None!")
-                out_f.close()
         except OSError as err:
             print("OS error at 775: {0}".format(err))
         except ValueError:
@@ -972,12 +1045,13 @@ class PID:
         except IOError:
             print ("File error with :", self.control_f)
         except:
-            print("Unexpected error at 781: ", sys.exc_info()[0])
+            print("Unexpected error: ", sys.exc_info()[0],sys.exc_info()[1])
             raise
         finally:
             out_f.close()
-            if(dbg1): print('PID_incremental_controller iteration completed normally.')
-        # End advance_PID
+            if(dbg1): print('PID controller iteration completed.')
+        # End advance PID
+        
         
         def get_average_error(self):
             leng = len(e1)
@@ -1034,9 +1108,16 @@ def improvement (acc, acc_last, acc_prev, Gaussian_noise):
     # THIS NEEDS TO ACCUMULATE A GAUSSIAN NOISE OUTSIDE
     difference1 = abs(acc - acc_last)
     difference2 = abs(acc_last - acc_prev)
-    if (difference1 < percentile * Gaussian_noise and difference1 < percentile * Gaussian_noise):
+    if (difference1 < percentile * Gaussian_noise and difference2 < percentile * Gaussian_noise):
+        if(dbg2 or dbg18): 
+            print("no improvement, discard last batch")
+            print("differnece1 = ",difference1,", difference2 = ",difference2)
+            if(dbg18): set_trace() #################
         return 0   # no improvement, discard last batch
     else:
+        if(dbg2 or dbg18): 
+            print("improvement -- move last batch to new baseBatch")
+            print("differnece1 = ",difference1,", difference2 = ",difference2)
         return 1   # improvement -- move last batch to new baseBatch
 
 
@@ -1064,6 +1145,7 @@ if (training):
     '''
     K = [Kp, Ki, Kd]  # initial parameters for PID and NN
     Gaussian = 0.0    # Kalman estimate of the distribution of NN accuracies
+    finalMAP = initialMAP
     training_cycles = 5   # keep it short for a while
     M = 20  # batch size short name
     batchSize = M
@@ -1080,7 +1162,6 @@ if (training):
                 count += 1
         fileSize = count
         if(dbg): print("fileSize = ",fileSize)
-        inp.close()
     except OSError as err:
         print("OS error at 884: {0}".format(err))
         success = 0
@@ -1091,7 +1172,7 @@ if (training):
         print ("File error with :", filename)
         success = 0
     except:
-        print("Unexpected error at 893: ", sys.exc_info()[0])
+        print("Unexpected error: ", sys.exc_info()[0],sys.exc_info()[1])
         success = 0
         raise
     finally:
@@ -1122,11 +1203,10 @@ if (training):
         # write baseBatch for the record, to be read later and parms varied in "deltaBatch"es
         baseBatch = fileRoot+str(n1)+".csv"   # base batch for n-th cycle
         try:
-            with open(baseBatch, 'w+', newline ='', encoding = "utf8") as outp:
+            with open(baseBatch, 'w', newline ='', encoding = "utf8") as outp:
                 csv_out = csv.writer(outp, delimiter=',')
                 for k in range(0, M):
                     csv_out.writerow(batch_rows[k])
-            outp.close()
         except OSError as err:
             print("OS error : {0}".format(err))
             print(print_frame())
@@ -1140,15 +1220,14 @@ if (training):
             print(print_frame())
             success = 0
         except:
-            print("Unexpected error : ", sys.exc_info()[0])
+            print("Unexpected error : ", sys.exc_info()[0],sys.exc_info()[1])
             success = 0
             print(print_frame())
-            raise
         finally:
             outp.close()
             if(dbg): print("Successfuly wrote batch ",baseBatch)
                
-        for i in range(0, batchSize):   #  Run varied batches through PID-NN
+        for i in range(0, numRows):   #  Run varied batches through PID-NN
             if(dbg7):
                 set_trace() ########################
             if (i == 0):
@@ -1164,7 +1243,7 @@ if (training):
                     print("newBatch size = ",fileSize," at i = ",i,", n = ",n1)
                     print(print_frame())
                     break
-            if(dbg): 
+            if(dbg7): 
                 print("--- At beginning looping over baseBatch = ",baseBatch)
                 print("    fileSize = ",fileSize)
             
@@ -1204,7 +1283,7 @@ if (training):
                 # Read the new "batch" and run PID on each measure in each row,
                 # computing a score from the final MAP reached by the PID.
                 if(dbg7):
-                    set_trace()
+                    set_trace() ####################
                 try:
                     rows = []
                     with open(deltaBatch, 'r', newline='', encoding="utf8") as inp:
@@ -1217,7 +1296,6 @@ if (training):
                     if (fileSize != M):
                         print("*** Wrong deltaBatch file size")
                         print(print_frame())
-                    inp.close()
 
                     for k in range(0,fileSize):
                         # For each row of batch_i_j, advance PID across simulated measurements
@@ -1227,12 +1305,15 @@ if (training):
 
                         # Run PID et al. across the k-th row
                         for m in range(0,row_size):
-                            if(dbg1): print("Inner loop m ",m," entering PID")
-                            pid = PID(i,j1,k,m,"bleeding.csv",row,"controls.csv",VB=2500,K0=2.1,alpha=0.5)
+                            owr = [ast.literal_eval(ep) for ep in row]
+                            if(dbg24): 
+                                print("Inner loop m ",m," entering PID")
+                                set_trace() #################
+                            pid = PID(i,j1,k,m,mp,"bleeding.csv",owr,"controls.csv",finalMAP)
                             pid.run_model()
-                            pid.advance_PID()   # value reached at end of row test
+                            pid.advance_PID(owr, m)   # value reached at end of row test
                             mp = pid.finalMAP
-                            if(dbg1): print(" finalMAP = ",mp)
+                            if(dbg1): print(" final MAP = ",mp)
                         if(dbg2):
                             set_trace() ###################################
 
@@ -1252,11 +1333,14 @@ if (training):
                     print ("File error with : ", baseBatch)
                     print(print_frame())
                     break
-                except:
-                    print("Unexpected error :", sys.exc_info()[0])
+                except IndexError:
+                    print ("Index error with : ", sys.exc_info()[0],sys.exc_info()[1])
                     print(print_frame())
                     break
-                    raise
+                except:
+                    print("Unexpected error : ", sys.exc_info()[0],sys.exc_info()[1])
+                    print(print_frame())
+                    break
                 finally:
                     inp.close()
                     if(dbg1):
@@ -1264,12 +1348,8 @@ if (training):
                         print("  K[",j1,"] = ",K[j1])
                 #--end inner loop
 
-                ave_score = ave_score / 3
                 
-                # sync up named parameters with K array
-                Kp = K[0]
-                Ki = K[1]
-                Kd = K[2]
+                ave_score = ave_score / 3
 
                 if(dbg):
                     print("Finished inner loops.  Now K = ",K)
@@ -1279,10 +1359,14 @@ if (training):
                 newBatch = fileRoot+str(i+1)+".csv"
                 create_batch_i(i+1, baseBatch, newBatch, K, scores, noise)
                 # Next iteration of i-loop should pick the new baseBatch up.
-                if(dbg7):
-                    set_trace() #####################
+
                 acc_prev = acc_last
                 acc_last = accuracy
+                accuracy = ave_score # if CNN is included, the CNN accuracy will be used instead
+                
+                if(dbg7):
+                    print("acc_prev = ",acc_prev,", acc_last = ",acc_last,", accuracy = ",accuracy)
+                    set_trace() #####################
 
                 if(dbg1): 
                     print("--- End of Loops i = ",i,", n = ",n1)
@@ -1302,17 +1386,22 @@ if (training):
                 if (fileSize < M):
                     print("*** newBatch is short : ",fileSize," Not running NN")
                 else:
-                    RESULTS = NeuralNet(newBatch)
+                    if(includeCNN == False):  #(I know you don't need the == True but easier on the eyes)
+                        loss = 0
+                        rmse = 0
+                    else:
+                        print("--- Starting NeuralNet --- ")
 
-                    loss = RESULTS[0]
-                    accuracy = RESULTS[1]
-                    '''Loss function measures the difference between the predicted label and the ground truth label. 
-                    E.g., square loss is  L(y^,y)=(y^−y)^2 , hinge loss is  L(y^,y)=max{0,1 − y^ x y} ...'''
-                    if (dbg):
-                        print("--NN RESULTS:",RESULTS)
-                        print("    accuracy  at 816 = ",accuracy)
-                        print(print_frame())
-                        print("  After NN call Kp = ",K[0],", Ki = ",K[1],", Kd = ",K[2])
+                        loss, accuracy = NeuralNet(newBatch)
+
+                        '''Loss function measures the difference between the predicted label and the ground truth label. 
+                        E.g., square loss is  L(y^,y)=(y^−y)^2 , hinge loss is  L(y^,y)=max{0,1 − y^ x y} ...'''
+                        if (dbg):
+                            print("--NN RESULTS:")
+                            print("    loss = ",loss,", accuracy = ",accuracy)
+                            print("    After NN call K's = ",K)
+                            if(dbg20): set_trace() ###################### ends NN 
+
                 # Estimate presumed Gaussian noise of the NN's accuracy
                 if (i == 0):
                     W1 = 1
@@ -1353,114 +1442,22 @@ if (training):
     #--end training n-loop
 #=========================================================
 else:
-    '''Validation test
+    '''Validation test:  (This is from PID_module and PID_NN).
     Read line from control.csv control file of past control;
-    run PID (which may input a fluid losses file as an option);
+    run PID, which may input a fluid losses file as an option;
     run pump simulator (basically a linear transfer function with lag)
     write line to control file;
     run NN to make a correction to PID output (trained separately for that as above);
     run "model" of body responses;
     compute error between body response and desired targetMAP.
     
-    As prerequisite, this depends on the parameters, K, being adequately trained
+    As precursor, this depends on the parameters, K, being adequately trained
     by the training loop.  Keeping its trained node weights, the NN now serves
     to make a small correction to the PID output.'''
     score = 0
-    total_score = 0
+    tot_score = 0
     num_scores = 0
     finalMAP = 0
     num_test_batches = 100
-    fileRoot_test = "NoisySinusoids.csv"  # could be random impulses for example
-    fileRoot_test = "Glitches.csv"  # could be random impulses for example
-    
-    if(dbg): 
-        print("Before outer loop, entering get_losses")
-    if(Cm == 1): get_losses("bleeding.csv")   # opens losses file for the fluid loss model
-    # Otherwise the PID appends new "v" values loop-by-loop
-    
-    i = 0
-    j = 0
-    k = 0
-    baseBatch = fileRoot_test
-    if(dbg):
-        print("--- Beginning test loop")
-        print("    Batch: ",baseBatch," at i = ",i)
-            
-    baseBatch = fileRoot_test
-    
-    # ADDED VERS 6.1
-    num_scores = 0
-    score = 0
-    tot_score = 0
-    # Read and run PID on each measure in each row
-    try:
-        rows = []
-        with open(baseBatch, 'r', newline='', encoding="utf8") as inp:
-            count = 0
-            csv_in = csv.reader(inp, delimiter=',')
-            for row in csv_in:
-                rows.append(row)
-                count += 1
-        length = count
-        if(dbg): print("Outer loop: Batch length is ",length)
-
-        for i in range(0,length):
-            # For each row of test_batch_i, advance PID across the simulated measurements
-            # keeping track of score and total score.
-            row = rows[i]
-            row_size = len(row)
-
-            # Run PID et al. across the i-th row
-            e1 = []   # empty this for a run over a row
-            u1 = []
-            v1 = []
-            for m in range(0,row_size):
-                if(dbg1): print("Inner loop m ",m," entering PID")
-
-                pid = PID(i,j,k,m,"bleeding.csv",row,"controls.csv",VB=2500,K0=2.1,alpha=0.5)
-                pid.run_model()
-                pid.advance_PID()   # value reached at end of row test            
-                mp = pid.finalMAP
-            if(dbg1):
-                print(" finalMAP = ",mp)  
-            ###score = 0
-            ###tot_score = 0
-            
-            # After the loop, mp is the last and hopefully best value achieved.
-
-            score = min(0.99, 1 - abs((mp - targetMAP) / targetMAP))
-            tot_score += score
-            num_scores += 1
-        inp.close()
-        ###if (num_scores > 0):
-        ###    ave_score = tot_score / num_scores
-        ###    print("")
-        ###    print("--- ave_score = ",ave_score)
-        ###else:
-        ###    print("*** num_scores = 0 at 1168")
-    except OSError as err:
-        print("OS error: {0}".format(err))
-        print(print_frame())
-        stop = True
-    except ValueError:
-        print("Could not convert data to an integer.")
-        print(print_frame())
-        stop = True
-    except:
-        print("Unexpected error at 1159: ", sys.exc_info()[0])
-        print(print_frame())
-        raise
-    finally:
-        print("Input file",baseBatch," closed")
-
-    if (num_scores > 0):
-        ave_score = tot_score / num_scores
-    else:
-        print("** Can't report ave_score since num_scores = 0")
-
-        
-    if(dbg):
-        print(" ")
-        print("--- End of trained run at i = ",i)
-        print("    tot_score = ",tot_score)
+    fileRoot_test = "NN_3parms_sinusoids"  # could be random impulses for example
 

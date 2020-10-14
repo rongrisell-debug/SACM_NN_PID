@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[7]:
+# In[2]:
 
 
 #Glitches  -- for  NeuralNetwork__Params_for_PID
@@ -48,7 +48,7 @@ def plot_dates_values(data):
 plot_dates_values(df_daily_jumpsup)
 
 class glitches:
-    def __init__(self, M, out_f = "NN_3parms_sinusoids.csv"):
+    def __init__(self, M, out_f = "Glitches.csv"):
         self.out_f = out_f
         self.M = M
 
@@ -85,6 +85,6 @@ class glitches:
             outp.close()
 
 # Check it -----------------------        
-sim = glitches(100,"NN_3parms_glitches.csv")
+sim = glitches(100,"Glitches.csv")
 sim.create_bleeding()
 
